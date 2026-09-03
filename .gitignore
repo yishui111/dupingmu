@@ -1,0 +1,30 @@
+# ===== 环境/构建产物 =====
+.venv/
+venv/
+dist/
+build/
+__pycache__/
+*.pyc
+
+# ===== 本机运行数据 / 个人记录（不入库）=====
+config.json
+*.log
+程序错误日志.txt
+指令发送记录.txt
+屏幕文字记录.txt
+屏幕画面描述.txt
+开发日志.md
+esp32/查看日志.bat
+
+# ===== esp32 Arduino 离线工具链（第三方下载件，体积大）=====
+esp32_offline_pack/
+esp32/esp32_offline_pack/
+*.zip
+*.exe
+*.tar.gz
+*.tar.bz2
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
