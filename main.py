@@ -263,7 +263,7 @@ def send_command(cmd, cfg):
     mode = cfg.get("send_mode", "serial")
     if mode == "tcp":
         host = cfg.get("tcp_host") or "127.0.0.1"
-        port = int(cfg.get("tcp_port") or 8080)
+        port = int(cfg.get("tcp_port") or 8085)
         with socket.create_connection((host, port), timeout=3) as s:
             s.sendall(data)
     else:
@@ -578,7 +578,7 @@ class ScreenTextMonitorApp:
         self.ent_host = tk.Entry(frm_if, textvariable=self.tcp_host_var, width=14)
         self.ent_host.grid(row=1, column=1, sticky="w", pady=2)
         tk.Label(frm_if, text="端口：").grid(row=1, column=2, sticky="e", padx=(14, 2))
-        self.tcp_port_var = tk.StringVar(value="8080")
+        self.tcp_port_var = tk.StringVar(value="8085")
         self.ent_port = tk.Entry(frm_if, textvariable=self.tcp_port_var, width=8)
         self.ent_port.grid(row=1, column=3, sticky="w", pady=2)
         tk.Label(frm_if, text="指令前缀：").grid(row=1, column=4, sticky="e", padx=(14, 2))
@@ -974,7 +974,7 @@ class ScreenTextMonitorApp:
         self.serial_port_var.set(str(cfg.get("serial_port", "COM3")))
         self.baudrate_var.set(str(cfg.get("baudrate", 115200)))
         self.tcp_host_var.set(str(cfg.get("tcp_host", "192.168.1.21")))
-        self.tcp_port_var.set(str(cfg.get("tcp_port", 8080)))
+        self.tcp_port_var.set(str(cfg.get("tcp_port", 8085)))
         self.cmd_prefix_var.set(str(cfg.get("cmd_prefix", "001")))
         self.cmd_suffix_var.set(str(cfg.get("cmd_suffix", "")))
 

@@ -10,7 +10,7 @@
     "serial_port": "COM3",
     "baudrate": "115200",
     "tcp_host": "192.168.1.100",
-    "tcp_port": "8080",
+    "tcp_port": "8085",
     "cmd_prefix": "001",
     "cmd_suffix": ""
   },

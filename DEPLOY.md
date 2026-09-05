@@ -17,7 +17,7 @@ start.bat        :: 或直接双击 start.bat / 启动(源码).bat
 
 ## 四、ESP32 端
 - 固件源码：`esp32\esp32_switch.ino`（Arduino IDE 打开烧录；接线与说明见 `esp32\README.md`）
-- 电脑与 ESP32 连同一 WiFi，发送方式选 `tcp`，主机填 ESP32 的 IP（默认端口 8080）
+- 电脑与 ESP32 连同一 WiFi，发送方式选 `tcp`，主机填 ESP32 的 IP（默认端口 8085）
 - arduino 离线工具链（第三方下载件）体积大，未入库；需要时从原作者机器 `esp32\esp32_offline_pack\` 复制或按 `esp32\README.md` 自行准备
 
 ## 五、配置

@@ -41,7 +41,7 @@
 
 // ================= 可修改配置 =================
 const char* DEVICE_ID     = "001";        // 本机设备号（指令前3位与之相同才执行）
-const uint16_t TCP_PORT   = 8080;         // 电脑端程序连的指令端口
+const uint16_t TCP_PORT   = 8085;         // 电脑端程序连的指令端口
 const char* AP_SSID       = "ESP32-Switch-Config";   // 配网热点名称
 const char* AP_PASS       = "";           // 热点密码（留空 = 无需密码）
 const uint32_t WIFI_TIMEOUT = 30000;      // 连接 WiFi 超时(毫秒)
