@@ -1,7 +1,9 @@
 {
   "region": [200, 200, 300, 60],
-  "interval": 1.0,
+  "interval": 0.5,
   "log_file": "屏幕文字记录.txt",
+  "log_daily": false,
+  "confirm_polls": 2,
   "driver": {
     "enabled": false,
     "send_mode": "tcp",

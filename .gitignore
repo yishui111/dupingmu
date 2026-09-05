@@ -28,3 +28,5 @@ esp32/esp32_offline_pack/
 .DS_Store
 Thumbs.db
 desktop.ini
+logs/
+diag_report.txt

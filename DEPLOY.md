@@ -22,6 +22,7 @@ start.bat        :: 或直接双击 start.bat / 启动(源码).bat
 
 ## 五、配置
 - 首次运行自动生成 `config.json`；本仓库只提供 `config.json.example` 模板
+- 常用配置：`interval` 识别间隔、`confirm_polls` 新文字确认轮数（1=出现即记）、`log_daily` 记录按日期分文件
 - DeepSeek API Key 填在程序界面（明文存本地 config.json，注意文件夹保密，勿提交仓库）
 
 ## 六、环境要求

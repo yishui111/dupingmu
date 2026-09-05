@@ -40,6 +40,8 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+import logging
+from logging.handlers import RotatingFileHandler
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -55,17 +57,46 @@ DEFAULT_LOG_FILE = APP_DIR / "屏幕文字记录.txt"
 ERROR_LOG_FILE = APP_DIR / "程序错误日志.txt"
 RULES_FILE = APP_DIR / "指令规则.txt"
 ACTION_LOG_FILE = APP_DIR / "指令发送记录.txt"
+LOG_FILE = APP_DIR / "logs" / "app.log"
 DEFAULT_VISION_LOG_FILE = APP_DIR / "屏幕画面描述.txt"
+
+VISION_COOLDOWN_SECONDS = 30   # 视觉自动调用的最小间隔（防高频变化时请求堆积）
+DRIVER_CONFIRM_POLLS = 2       # 驱动器触发文字需连续命中的 OCR 轮数（防抖动重复发指令）
 
 
 def write_error_log(exc_text):
     """把后台线程里的异常写入错误日志文件，方便打包后排查。"""
+    try:
+        logging.getLogger().error("后台异常: %s", exc_text[:2000])
+    except Exception:
+        pass
     try:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{stamp}]\n{exc_text}\n\n")
     except Exception:
         pass
+
+def _setup_logging():
+    """初始化滚动日志：logs/app.log（保留约 1MB）。"""
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        h = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=1, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(funcName)s:%(lineno)d %(message)s"))
+        root = logging.getLogger()
+        root.setLevel(logging.INFO)
+        root.addHandler(h)
+    except Exception:
+        pass
+
+def _install_excepthook():
+    """未捕获异常自动写入日志。"""
+    def hook(exc_type, exc_value, exc_tb):
+        try:
+            write_error_log("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+        except Exception:
+            pass
+    sys.excepthook = hook
 
 # ---- Windows 下开启 DPI 感知：让框选坐标与截图坐标一致（高分屏/缩放必做） ----
 if sys.platform == "win32":
@@ -90,14 +121,33 @@ def create_ocr():
     return RapidOCR()
 
 
-def capture_region(x, y, w, h):
-    """截取屏幕指定区域，返回 PIL 图像（坐标为物理像素）。"""
+def capture_region(x, y, w, h, sct=None):
+    """截取屏幕指定区域，自动钳制到屏幕内，返回 PIL 图像。
+
+    sct 可传入复用的 mss 实例（监控循环复用它，避免每轮重建 GDI 资源）；
+    不传则临时创建（手动识别等低频场景）。
+    """
     import mss
     from PIL import Image
-    with mss.mss() as sct:
-        shot = sct.grab({"left": int(x), "top": int(y),
-                         "width": max(int(w), 1), "height": max(int(h), 1)})
-    return Image.frombytes("RGB", shot.size, shot.rgb)
+    own = sct is None
+    if own:
+        sct = mss.mss()
+    try:
+        v = sct.monitors[0]
+        vx0, vy0 = int(v["left"]), int(v["top"])
+        vx1, vy1 = vx0 + int(v["width"]), vy0 + int(v["height"])
+        x0 = max(vx0, int(x))
+        y0 = max(vy0, int(y))
+        x1 = min(vx1, int(x) + max(int(w), 1))
+        y1 = min(vy1, int(y) + max(int(h), 1))
+        if x1 <= x0 or y1 <= y0:
+            raise ValueError("监控区域超出屏幕范围，请重新框选: " + str((int(x), int(y), int(w), int(h))))
+        shot = sct.grab({"left": x0, "top": y0,
+                         "width": x1 - x0, "height": y1 - y0})
+        return Image.frombytes("RGB", shot.size, shot.rgb)
+    finally:
+        if own:
+            sct.close()
 
 
 def ocr_image(ocr, img):
@@ -356,18 +406,38 @@ class ScreenTextMonitorApp:
         self.ocr = None
         self._active_log = str(DEFAULT_LOG_FILE)   # 监控期间使用的记录文件（启动时快照）
         self._active_interval = 2                  # 监控期间使用的识别间隔（启动时快照）
+        self._active_log_daily = False             # 监控期间是否按日期分文件（快照）
+        self._active_confirm_polls = 2             # 监控期间的新文字确认轮数（快照）
+        # 以下均为运行快照：后台线程一律用快照，不直接读 Tk 变量（Tkinter 非线程安全）
+        self._active_driver_enabled = True
+        self._active_driver_cfg = {}
+        self._active_vision_enabled = False
+        self._active_vision_auto = True
+        self._active_vision_cfg = {}
+        self._active_vision_log = str(DEFAULT_VISION_LOG_FILE)
+        self._vision_lock = threading.Lock()
+        self._vision_busy = False                  # 视觉请求在飞标志（防并发堆积）
+        self._vision_ts = 0.0                      # 上次视觉调用时间（冷却用）
+        self._serial = None                        # 常驻串口连接（避免每次发送重开端口复位 ESP32）
+        self._serial_key = None
 
         self.rules = []               # 文字驱动器规则列表
         self._driver_state = []       # 每条规则的运行状态 {"text_hit","kw_hit","active","off_due"}
 
         self.interval_var = tk.DoubleVar(value=0.5)
         self.log_var = tk.StringVar(value=str(DEFAULT_LOG_FILE))
+        self.log_daily_var = tk.BooleanVar(value=False)     # 记录按日期分文件
+        self.confirm_polls_var = tk.IntVar(value=2)         # 新文字连续出现几轮才落盘
         self.region_var = tk.StringVar(value="（未选择）")
         self.status_var = tk.StringVar(value="就绪：请先框选要监控的屏幕区域")
 
         self._build_ui()
         self._load_config()
         self._load_driver_rules(announce=False)
+        self._refresh_active_settings()
+        self._send_queue = queue.Queue()
+        threading.Thread(target=self._sender_loop, daemon=True,
+                         name="cmd-sender").start()   # 指令发送线程：串口/TCP 超时不阻塞监控
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(200, self._poll_queue)
 
@@ -402,8 +472,14 @@ class ScreenTextMonitorApp:
                                         format="%.1f",
                                         textvariable=self.interval_var, width=6)
         self.interval_spin.pack(side="left")
+        tk.Label(frm_set, text="确认轮数(1=出现即记)：").pack(side="left", padx=(14, 0))
+        self.confirm_spin = tk.Spinbox(frm_set, from_=1, to=5, increment=1,
+                                       textvariable=self.confirm_polls_var, width=3)
+        self.confirm_spin.pack(side="left")
         self.btn_test = tk.Button(frm_set, text="立即识别一次", command=self.test_recognize)
         self.btn_test.pack(side="right", padx=4)
+        self.btn_copylog = tk.Button(frm_set, text="复制日志(报错用)", command=self.copy_logs_for_dev)
+        self.btn_copylog.pack(side="right", padx=4)
 
         frm_log = tk.LabelFrame(self.tab_monitor, text="记录文件（记事本）", padx=10, pady=8)
         frm_log.pack(fill="x", **pad)
@@ -411,6 +487,9 @@ class ScreenTextMonitorApp:
         self.log_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.btn_log = tk.Button(frm_log, text="选择…", command=self.choose_log_file)
         self.btn_log.pack(side="left")
+        self.chk_log_daily = tk.Checkbutton(frm_log, text="按日期分文件（每天一个新 txt）",
+                                            variable=self.log_daily_var)
+        self.chk_log_daily.pack(side="left", padx=(10, 0))
 
         frm_ctrl = tk.Frame(self.tab_monitor)
         frm_ctrl.pack(fill="x", **pad)
@@ -437,8 +516,10 @@ class ScreenTextMonitorApp:
         top = tk.Frame(self.tab_driver)
         top.pack(fill="x", **pad)
         self.driver_enabled_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(top, text="启用文字驱动器（监控/识别时自动匹配屏幕文字并发送指令）",
-                       variable=self.driver_enabled_var).pack(side="left")
+        self.chk_driver_enabled = tk.Checkbutton(
+            top, text="启用文字驱动器（监控/识别时自动匹配屏幕文字并发送指令）",
+            variable=self.driver_enabled_var)
+        self.chk_driver_enabled.pack(side="left")
         tk.Label(top, text="规则文件：指令规则.txt（也可用记事本直接编辑）",
                  fg="gray").pack(side="right")
 
@@ -527,9 +608,11 @@ class ScreenTextMonitorApp:
         top = tk.Frame(self.tab_vision)
         top.pack(fill="x", **pad)
         self.vision_enabled_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(top, text="启用 DeepSeek 视觉理解",
-                       variable=self.vision_enabled_var,
-                       command=self._vision_enabled_changed).pack(side="left")
+        self.chk_vision_enabled = tk.Checkbutton(
+            top, text="启用 DeepSeek 视觉理解",
+            variable=self.vision_enabled_var,
+            command=self._vision_enabled_changed)
+        self.chk_vision_enabled.pack(side="left")
         tk.Label(top, text="需要联网 + DeepSeek API Key（api.deepseek.com 申请）",
                  fg="gray").pack(side="right")
 
@@ -555,8 +638,10 @@ class ScreenTextMonitorApp:
         frm2 = tk.LabelFrame(self.tab_vision, text="描述设置", padx=10, pady=6)
         frm2.pack(fill="x", **pad)
         self.vision_auto_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(frm2, text="屏幕文字变化时自动调用视觉模型描述画面",
-                       variable=self.vision_auto_var).pack(side="left")
+        self.chk_vision_auto = tk.Checkbutton(
+            frm2, text="屏幕文字变化时自动调用视觉模型描述画面",
+            variable=self.vision_auto_var)
+        self.chk_vision_auto.pack(side="left")
         tk.Label(frm2, text="记录文件：").pack(side="left", padx=(16, 2))
         self.vision_log_var = tk.StringVar(value=str(DEFAULT_VISION_LOG_FILE))
         self.ent_vis_log = tk.Entry(frm2, textvariable=self.vision_log_var, width=28)
@@ -612,7 +697,10 @@ class ScreenTextMonitorApp:
                   self.btn_rule_reload, self.btn_rule_test, self.btn_save_cfg,
                   self.cmb_mode, self.ent_serial, self.ent_baud,
                   self.ent_host, self.ent_port, self.ent_prefix, self.ent_suffix,
-                  self.btn_vis_test):
+                  self.btn_vis_test, self.confirm_spin, self.chk_log_daily,
+                  self.chk_driver_enabled, self.chk_vision_enabled,
+                  self.chk_vision_auto, self.ent_vis_key, self.ent_vis_url,
+                  self.ent_vis_model):
             b.config(state=state_r)
 
     # ================= 区域框选 =================
@@ -652,6 +740,7 @@ class ScreenTextMonitorApp:
         if not self.region:
             messagebox.showwarning("提示", "请先框选监控区域")
             return
+        self._refresh_active_settings()
 
         def work():
             try:
@@ -663,9 +752,11 @@ class ScreenTextMonitorApp:
                 self._driver_tick(text)               # 文字驱动器匹配
                 self.msg_queue.put(("last", text or "（区域内未识别到文字）"))
                 self.msg_queue.put(("status", "手动识别完成"))
-                if self.vision_enabled_var.get() and self.vision_auto_var.get():
+                if self._active_vision_enabled and self._active_vision_auto:
                     threading.Thread(target=self._vision_worker,
-                                     args=(img,), daemon=True).start()
+                                     args=(img, False, self._active_vision_cfg,
+                                           self._active_vision_log),
+                                     daemon=True).start()
             except Exception as e:
                 err = f"识别失败：{e}\n{traceback.format_exc()}"
                 write_error_log(err)
@@ -674,21 +765,46 @@ class ScreenTextMonitorApp:
         threading.Thread(target=work, daemon=True).start()
 
     # ================= 监控主循环 =================
+    def copy_logs_for_dev(self):
+        """一键复制最近日志（app.log + 程序错误日志 各 30 行）到剪贴板，发给开发者。"""
+        try:
+            chunks = ["【日志（供定位）build=20260905-opt1】"]
+            for path in (LOG_FILE, ERROR_LOG_FILE):
+                chunks.append("===== " + path.name + " 尾部 30 行 =====")
+                if path.exists():
+                    try:
+                        tail = open(path, encoding="utf-8", errors="replace").read().splitlines()[-30:]
+                        chunks.extend(tail)
+                    except Exception as e:
+                        chunks.append("读取失败: " + str(e))
+                else:
+                    chunks.append("(暂无日志)")
+            text = "\n".join(chunks)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update()
+            messagebox.showinfo("已复制", "最近日志已复制到剪贴板。\n\n用法：回到对话里，先写一句现象描述，再直接粘贴日志，即可发给开发者。")
+        except Exception as e:
+            messagebox.showerror("复制失败", "无法复制日志：" + str(e) + "\n请手动打开 logs\\app.log 发最后 30 行。")
     def start_monitor(self):
         if self.running:
             return
         if not self.region:
             messagebox.showwarning("提示", "请先框选监控区域")
             return
+        self._refresh_active_settings()
         self.running = True
+        logging.getLogger().info(
+            "开始监控 region=%s interval=%s confirm=%s log=%s daily=%s",
+            self.region, self._active_interval, self._active_confirm_polls,
+            Path(self._active_log).name, self._active_log_daily)
         self._set_running_ui(True)
-        self._active_interval = max(float(self.interval_var.get()), 0.5)
-        self._active_log = self.log_var.get()
         self._save_config()
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.monitor_thread.start()
 
     def stop_monitor(self):
+        logging.getLogger().info("停止监控")
         self.running = False
         self.status_var.set("正在停止…")
 
@@ -698,24 +814,34 @@ class ScreenTextMonitorApp:
         针对“评论区逐条弹字”场景做的优化：
         1. 像素级预检：画面没变就不跑 OCR，CPU 占用低，轮询可以很快不漏评论；
         2. 只记新增：对比上一帧，只有“新出现的文字行”才落盘，重复/滚动不重记；
-        3. 稳定确认：同一行连续出现 2 次才写记录，滤掉 OCR 半帧/抖动产生的垃圾。
+        3. 稳定确认：同一行连续出现 N 轮（默认 2，界面可调）才写记录，滤掉 OCR 半帧/抖动；
+        4. mss 实例整个监控期间复用（出错自动重建）；指令发送走独立线程不阻塞截图；
+           画面静止时也会按时发送到期的关闭指令（不依赖 OCR 触发）。
         """
+        import mss
+        sct = None                       # 复用的 mss 实例（失败时置 None 下一轮重建）
         try:
             if self.ocr is None:
                 self.msg_queue.put(("status", "正在加载离线 OCR 模型（首次约需数秒）…"))
                 self.ocr = create_ocr()
             self.msg_queue.put(("status", "OCR 已就绪，开始监控（只记录新出现的文字）…"))
+            logging.getLogger().info("监控循环已启动")
 
             step = 0.1                       # 轮询步长（秒）
-            confirm_polls = 2                # 新文字行需连续出现几次才落盘
+            confirm_polls = max(int(self._active_confirm_polls), 1)
             prev_counts = {}                 # 上一帧各文字行的出现次数
             candidates = {}                  # 待确认的新文字行 -> 已连续出现次数
             prev_img_bytes = None            # 上一帧图像字节（像素级“变了才 OCR”预检）
             last_full_text = None            # 上一帧完整文字（用于触发视觉描述）
 
+            capture_failures = 0
             while self.running:
+                if sct is None:
+                    sct = mss.mss()
+                self._fire_due_offs(time.time())   # 画面静止时也能按时发到期的关闭指令
                 try:
-                    img = capture_region(*self.region)
+                    img = capture_region(*self.region, sct=sct)
+                    capture_failures = 0
                     raw = img.tobytes()
                     changed = (raw != prev_img_bytes)
                     prev_img_bytes = raw
@@ -751,11 +877,26 @@ class ScreenTextMonitorApp:
                         # 完整文字发生变化时自动调视觉模型描述画面（后台线程，不阻塞监控）
                         if text != last_full_text:
                             last_full_text = text
-                            if (self.vision_enabled_var.get()
-                                    and self.vision_auto_var.get()):
+                            if self._active_vision_enabled and self._active_vision_auto:
                                 threading.Thread(target=self._vision_worker,
-                                                 args=(img,), daemon=True).start()
+                                                 args=(img, False,
+                                                       self._active_vision_cfg,
+                                                       self._active_vision_log),
+                                                 daemon=True).start()
                 except Exception as e:
+                    msg = str(e)
+                    if ("ScreenShotError" in msg or "graphics function failed" in msg or "不在屏幕范围" in msg):
+                        capture_failures += 1
+                        try:
+                            sct.close()          # 截图失败常意味着 mss 句柄失效，重建
+                        except Exception:
+                            pass
+                        sct = None
+                        if capture_failures == 1:
+                            write_error_log("截图失败（将自动重试，不停止监控）：" + msg)
+                            self.msg_queue.put(("status", "截图失败，自动重试中（区域可能超出屏幕）…"))
+                        time.sleep(0.5)
+                        continue
                     err = f"监控出错：{e}\n{traceback.format_exc()}"
                     write_error_log(err)
                     self.msg_queue.put(("error", f"监控出错：{e}（详见 程序错误日志.txt）"))
@@ -771,11 +912,19 @@ class ScreenTextMonitorApp:
             write_error_log(err)
             self.msg_queue.put(("error", "监控线程异常（详见 程序错误日志.txt）"))
         finally:
+            try:
+                if sct is not None:
+                    sct.close()
+            except Exception:
+                pass
             self.msg_queue.put(("monitor_stopped", "", ""))
 
     def _append_log(self, text):
         try:
             path = Path(self._active_log).expanduser()
+            if self._active_log_daily:
+                path = path.with_name(
+                    f"{path.stem}_{datetime.now():%Y-%m-%d}{path.suffix}")
             path.parent.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(path, "a", encoding="utf-8") as f:
@@ -794,7 +943,8 @@ class ScreenTextMonitorApp:
 
     @staticmethod
     def _new_rule_state():
-        return {"text_hit": False, "kw_hit": False, "active": False, "off_due": None}
+        return {"text_hit": False, "kw_hit": False, "active": False,
+                "off_due": None, "text_streak": 0}
 
     def _refresh_rule_tree(self):
         self.rule_tree.delete(*self.rule_tree.get_children())
@@ -828,27 +978,49 @@ class ScreenTextMonitorApp:
         self.cmd_prefix_var.set(str(cfg.get("cmd_prefix", "001")))
         self.cmd_suffix_var.set(str(cfg.get("cmd_suffix", "")))
 
+    def _refresh_active_settings(self):
+        """主线程把界面设置快照成普通变量，供后台线程使用（Tk 变量不能跨线程读）。"""
+        self._active_interval = max(float(self.interval_var.get()), 0.5)
+        self._active_log = self.log_var.get()
+        self._active_log_daily = bool(self.log_daily_var.get())
+        try:
+            self._active_confirm_polls = max(int(self.confirm_polls_var.get()), 1)
+        except Exception:
+            self._active_confirm_polls = 2
+        self._active_driver_enabled = bool(self.driver_enabled_var.get())
+        self._active_driver_cfg = self._get_driver_cfg()
+        self._active_vision_enabled = bool(self.vision_enabled_var.get())
+        self._active_vision_auto = bool(self.vision_auto_var.get())
+        self._active_vision_cfg = self._get_vision_cfg()
+        self._active_vision_log = self.vision_log_var.get()
+
     def _save_driver_settings(self):
+        self._refresh_active_settings()
         self._save_config()
         self.driver_status_var.set("接口设置已保存")
         self.status_var.set("接口设置已保存")
 
     def _driver_tick(self, text):
-        """按 OCR 文字更新规则状态：文字包含触发文字 → 发命中指令并排程关闭指令。"""
-        if not self.driver_enabled_var.get():
+        """按 OCR 文字更新规则状态：触发文字连续 DRIVER_CONFIRM_POLLS 轮命中才发指令。
+
+        不做确认的话，OCR 半帧漏识别一轮就会让规则掉线再上线，导致 on 指令重复发送。
+        """
+        if not self._active_driver_enabled:
             return
         now = time.time()
         for i, rule in enumerate(self.rules):
             if i >= len(self._driver_state):
                 continue
             st = self._driver_state[i]
-            st["text_hit"] = bool(rule["text"]) and rule["text"] in text
+            raw_hit = bool(rule["text"]) and rule["text"] in text
+            st["text_streak"] = st.get("text_streak", 0) + 1 if raw_hit else 0
+            st["text_hit"] = raw_hit and st["text_streak"] >= DRIVER_CONFIRM_POLLS
             self._update_rule_state(rule, st, now)
         self._fire_due_offs(now)
 
     def _driver_keyword_tick(self, description):
         """按视觉描述更新规则状态：描述包含画面关键词 → 触发指令（智能匹配）。"""
-        if not self.driver_enabled_var.get():
+        if not self._active_driver_enabled:
             return
         now = time.time()
         for i, rule in enumerate(self.rules):
@@ -878,20 +1050,64 @@ class ScreenTextMonitorApp:
                 self._driver_send(rule, rule["off"])
 
     def _driver_send(self, rule, code):
+        """把指令放进发送队列即返回（实际发送在独立线程，串口/TCP 超时不阻塞监控）。"""
         if not code:
             return
-        cfg = self._get_driver_cfg()
-        cmd = cfg["cmd_prefix"] + code + cfg["cmd_suffix"]
-        try:
-            send_command(cmd, cfg)
-            msg = f"命中“{rule['text'] or rule.get('kw', '')}”→ 已发送指令 {cmd}"
-            self._append_action_log(msg)
-            self.msg_queue.put(("dstatus", datetime.now().strftime(
-                "%H:%M:%S") + " " + msg))
-        except Exception as e:
-            err = f"发送指令失败：{e}\n{traceback.format_exc()}"
-            write_error_log(err)
-            self.msg_queue.put(("error", f"发送指令失败：{e}（详见 程序错误日志.txt）"))
+        cfg = self._active_driver_cfg or self._get_driver_cfg()
+        cmd = cfg.get("cmd_prefix", "") + code + cfg.get("cmd_suffix", "")
+        self._send_queue.put((cmd, cfg, rule.get("text") or rule.get("kw", "")))
+
+    def _sender_loop(self):
+        """指令发送线程：逐条发送队列里的指令，成功/失败都写日志并更新界面状态。"""
+        while True:
+            cmd, cfg, label = self._send_queue.get()
+            try:
+                if cfg.get("send_mode") == "tcp":
+                    send_command(cmd, cfg)
+                else:
+                    self._serial_send(cmd, cfg)
+                msg = f"命中“{label}”→ 已发送指令 {cmd}"
+                self._append_action_log(msg)
+                self.msg_queue.put(("dstatus", datetime.now().strftime(
+                    "%H:%M:%S") + " " + msg))
+            except Exception as e:
+                if self._serial is not None:       # 发送失败则重建串口连接
+                    try:
+                        self._serial.close()
+                    except Exception:
+                        pass
+                    self._serial = None
+                err = f"发送指令失败：{e}\n{traceback.format_exc()}"
+                write_error_log(err)
+                self.msg_queue.put(("error", f"发送指令失败：{e}（详见 程序错误日志.txt）"))
+
+    def _serial_send(self, cmd, cfg):
+        """串口发送：端口整个运行期保持打开，避免每次开关串口把 ESP32 复位。"""
+        import serial
+        key = (cfg.get("serial_port") or "COM3", str(cfg.get("baudrate") or 115200))
+        if self._serial is not None and self._serial_key != key:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+            self._serial = None
+        if self._serial is None:
+            ser = serial.Serial()
+            ser.port = key[0]
+            ser.baudrate = int(key[1])
+            ser.timeout = 2
+            ser.write_timeout = 2
+            ser.open()
+            # 打开后立即拉低 DTR/RTS，减小自动复位电路误触发 EN/GPIO0 的概率
+            for attr in ("dtr", "rts"):
+                try:
+                    setattr(ser, attr, False)
+                except Exception:
+                    pass
+            self._serial = ser
+            self._serial_key = key
+        self._serial.write(cmd.encode("utf-8"))
+        self._serial.flush()
 
     def _append_action_log(self, msg):
         try:
@@ -1000,11 +1216,8 @@ class ScreenTextMonitorApp:
             return
         idx = self.rule_tree.index(sel[0])
         rule = self.rules[idx]
-
-        def work():
-            self._driver_send(rule, rule["on"])
-
-        threading.Thread(target=work, daemon=True).start()
+        self._refresh_active_settings()
+        self._driver_send(rule, rule["on"])
 
     # ================= DeepSeek 视觉 =================
     def _get_vision_cfg(self):
@@ -1018,12 +1231,29 @@ class ScreenTextMonitorApp:
         if not self.region:
             messagebox.showwarning("提示", "请先框选监控区域")
             return
-        threading.Thread(target=self._vision_worker, args=(None,), daemon=True).start()
+        threading.Thread(target=self._vision_worker,
+                         args=(None, True, self._get_vision_cfg(),
+                               self.vision_log_var.get()),
+                         daemon=True).start()
 
-    def _vision_worker(self, img=None):
-        """后台线程：截图（如需）→ 调 DeepSeek 视觉 API → 写记录 + 智能指令匹配。"""
+    def _vision_worker(self, img=None, manual=True, cfg=None, log_path=None):
+        """后台线程：截图（如需）→ 调 DeepSeek 视觉 API → 写记录 + 智能指令匹配。
+
+        manual=False 是监控自动触发：同一时刻只允许一个请求，且有最小间隔冷却，
+        避免评论区高频变化时请求堆积（费用/限流/重复触发关键词指令）。
+        """
+        with self._vision_lock:
+            if self._vision_busy:
+                if manual:
+                    self.msg_queue.put(("vstatus", "上一次视觉请求还在进行，请稍候…"))
+                return
+            if not manual and time.time() - self._vision_ts < VISION_COOLDOWN_SECONDS:
+                return
+            self._vision_busy = True
+            self._vision_ts = time.time()
         try:
-            cfg = self._get_vision_cfg()
+            if cfg is None:
+                cfg = self._get_vision_cfg()
             if not cfg.get("api_key"):
                 self.msg_queue.put(("error", "请先在“DeepSeek 视觉”页签填写 API Key"))
                 return
@@ -1031,7 +1261,7 @@ class ScreenTextMonitorApp:
                 img = capture_region(*self.region)
             self.msg_queue.put(("vstatus", "正在调用 DeepSeek 视觉模型…"))
             desc = vision_describe(img, cfg)
-            self._append_vision_log(desc)
+            self._append_vision_log(desc, log_path)
             self._driver_keyword_tick(desc)          # 画面关键词智能匹配
             self.msg_queue.put(("vdesc", desc))
             self.msg_queue.put(("vstatus", datetime.now().strftime(
@@ -1040,10 +1270,12 @@ class ScreenTextMonitorApp:
             err = f"视觉理解失败：{e}\n{traceback.format_exc()}"
             write_error_log(err)
             self.msg_queue.put(("error", f"视觉理解失败：{e}（详见 程序错误日志.txt）"))
+        finally:
+            self._vision_busy = False
 
-    def _append_vision_log(self, desc):
+    def _append_vision_log(self, desc, path=None):
         try:
-            path = Path(self.vision_log_var.get()).expanduser()
+            path = Path(path or self.vision_log_var.get()).expanduser()
             path.parent.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(path, "a", encoding="utf-8") as f:
@@ -1064,6 +1296,10 @@ class ScreenTextMonitorApp:
 
     def open_log_file(self):
         path = Path(self.log_var.get()).expanduser()
+        daily = self._active_log_daily if self.running else bool(self.log_daily_var.get())
+        if daily:
+            path = path.with_name(
+                f"{path.stem}_{datetime.now():%Y-%m-%d}{path.suffix}")
         if not path.exists():
             messagebox.showinfo("提示", f"记录文件还不存在：\n{path}\n\n开始监控并出现文字变化后会自动创建。")
             return
@@ -1083,7 +1319,12 @@ class ScreenTextMonitorApp:
                     self.region = (x, y, w, h)
                     self.region_var.set(f"坐标 ({x}, {y})   宽 {w} × 高 {h}")
                 try:
-                    self.interval_var.set(float(cfg.get("interval", 1)))
+                    self.interval_var.set(float(cfg.get("interval", 0.5)))
+                except Exception:
+                    pass
+                self.log_daily_var.set(bool(cfg.get("log_daily", False)))
+                try:
+                    self.confirm_polls_var.set(max(int(cfg.get("confirm_polls", 2)), 1))
                 except Exception:
                     pass
                 lp = cfg.get("log_file")
@@ -1110,6 +1351,8 @@ class ScreenTextMonitorApp:
                 "region": list(self.region) if self.region else None,
                 "interval": self.interval_var.get(),
                 "log_file": self.log_var.get(),
+                "log_daily": bool(self.log_daily_var.get()),
+                "confirm_polls": int(self.confirm_polls_var.get()),
                 "driver": {
                     "enabled": bool(self.driver_enabled_var.get()),
                     "send_mode": self.send_mode_var.get(),
@@ -1173,6 +1416,11 @@ class ScreenTextMonitorApp:
 
     def _on_close(self):
         self.running = False
+        if self._serial is not None:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
         self._save_config()
         self.root.destroy()
 
@@ -1181,6 +1429,8 @@ class ScreenTextMonitorApp:
 # 命令行自检：不联网、不开窗口，验证离线 OCR 可用
 # ============================================================
 def selftest():
+    _setup_logging()
+    logging.getLogger().info("selftest start")
     from PIL import Image, ImageDraw, ImageFont
     print("正在加载离线 OCR 模型…")
     ocr = create_ocr()
@@ -1191,7 +1441,7 @@ def selftest():
     for name in ("msyh.ttc", "simhei.ttf", "arial.ttf"):
         try:
             font = ImageFont.truetype(name, 40)
-            break
+            break                    # 用第一个可用的中文字体，别继续往后覆盖成 arial
         except Exception:
             continue
     if font is None:
@@ -1208,10 +1458,40 @@ def selftest():
 
 
 def main():
+    _setup_logging()
+    _install_excepthook()
+    logging.getLogger().info("程序启动 build=20260905-opt1 args=%s", sys.argv[1:])
     if "--selftest" in sys.argv:
         sys.exit(selftest())
+    if "--diag" in sys.argv:
+        rep = APP_DIR / "diag_report.txt"
+        out = []
+        for path in (LOG_FILE, ERROR_LOG_FILE):
+            out.append("===== " + path.name + " 尾部 30 行 =====")
+            if path.exists():
+                try:
+                    tail = open(path, encoding="utf-8", errors="replace").read().splitlines()[-30:]
+                    out.extend(tail)
+                except Exception as e:
+                    out.append("读取失败: " + str(e))
+            else:
+                out.append("(文件不存在)")
+        rep.write_text("\n".join(out), encoding="utf-8")
+        print("诊断报告已生成：" + str(rep))
+        print("请把该文件或 logs\\app.log 尾部 30 行发给开发者。")
+        sys.exit(0)
     root = tk.Tk()
+
+    def _report(exc_type, exc_value, exc_tb):
+        write_error_log("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+        try:
+            root.after(0, lambda: messagebox.showerror("程序错误", "发生未处理错误。\n\n请把日志发给开发者：\n" + str(LOG_FILE) + "\n\n详情：" + str(exc_value)))
+        except Exception:
+            pass
+
+    root.report_callback_exception = _report
     ScreenTextMonitorApp(root)
+    logging.getLogger().info("UI 启动完成")
     root.mainloop()
 
 
