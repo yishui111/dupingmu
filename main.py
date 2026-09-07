@@ -64,16 +64,33 @@ VISION_COOLDOWN_SECONDS = 30   # 视觉自动调用的最小间隔（防高频�
 DRIVER_CONFIRM_POLLS = 2       # 驱动器触发文字需连续命中的 OCR 轮数（防抖动重复发指令）
 
 
+def append_text_capped(path, text, max_bytes=2_000_000):
+    """追加写入文本文件；超过 max_bytes 时先把旧文件滚动为 .old（只留一份）。
+
+    用于错误日志、指令发送记录这类只增不减的文件，防止长期挂机无限膨胀。
+    监控记录文件（屏幕文字记录）不在这里截断——用户数据不能丢，要分文件用界面选项。
+    """
+    path = Path(path)
+    try:
+        if path.exists() and path.stat().st_size > max_bytes:
+            old = path.with_name(path.name + ".old")
+            if old.exists():
+                old.unlink()
+            path.replace(old)
+    except Exception:
+        pass
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text)
+
 def write_error_log(exc_text):
-    """把后台线程里的异常写入错误日志文件，方便打包后排查。"""
+    """把后台线程里的异常写入错误日志文件，方便打包后排查（超 2MB 自动滚动）。"""
     try:
         logging.getLogger().error("后台异常: %s", exc_text[:2000])
     except Exception:
         pass
     try:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{stamp}]\n{exc_text}\n\n")
+        append_text_capped(ERROR_LOG_FILE, f"[{stamp}]\n{exc_text}\n\n")
     except Exception:
         pass
 
@@ -97,6 +114,25 @@ def _install_excepthook():
         except Exception:
             pass
     sys.excepthook = hook
+
+# ---- 单实例锁：防止重复启动（双开会同时写记录、抢串口） ----
+_single_instance_mutex = None
+
+def _acquire_single_instance():
+    """尝试获取程序级互斥锁；已有实例在跑时返回 False。
+
+    锁句柄保存在模块全局里，进程存活期间一直持有，退出时由系统回收。
+    """
+    global _single_instance_mutex
+    if sys.platform != "win32":
+        return True
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _single_instance_mutex = k32.CreateMutexW(
+            None, False, "Local\\dupingmu_screen_text_monitor")
+        return ctypes.get_last_error() != 183      # 183 = ERROR_ALREADY_EXISTS
+    except Exception:
+        return True                                # 拿不到锁就不拦截，保证能用
 
 # ---- Windows 下开启 DPI 感知：让框选坐标与截图坐标一致（高分屏/缩放必做） ----
 if sys.platform == "win32":
@@ -190,14 +226,16 @@ def diff_new_lines(prev_counts, lines):
 # ============================================================
 # 文字驱动器：规则文件读写 + 指令发送
 # ============================================================
-RULES_TEMPLATE = """# 文字驱动器规则文件（每行一条规则，用 | 分隔，支持 # 注释）
+RULES_HEADER = """# 文字驱动器规则文件（每行一条规则，用 | 分隔，支持 # 注释）
 # 格式：触发文字|命中指令|关闭指令|延时秒|画面关键词
 # 触发文字：屏幕 OCR 文字包含它即命中（可留空，仅用画面关键词）
 # 画面关键词：DeepSeek 视觉描述文本包含它即命中（可留空，仅用触发文字）
 # 命中后发送“指令前缀+命中指令”；延时秒后发送“指令前缀+关闭指令”（延时0或不填关闭指令则不发送）
 # ★ 修改话术：记事本改本文件 → 程序里点“重新加载规则文件”；或程序里“编辑规则”
 # 开关对应：1号=灯(GPIO14) 2号=风扇 3号=空调 4号=电视 5号=电脑 6号=热水器 7号=窗帘 8号=水泵
-# 直播刷礼物示例：礼物出现→开，N秒后自动关（延时改成0则一直亮等关闭话术）
+# 直播刷礼物示例：礼物出现→开，N秒后自动关（延时改成0则一直亮等关闭话术）"""
+
+RULES_TEMPLATE = RULES_HEADER + """
 小心心|001on|001off|15|
 爱心|001on|001off|15|
 棒棒糖|002on|002off|15|
@@ -245,10 +283,9 @@ def load_rules(path=RULES_FILE):
 
 
 def save_rules(rules, path=RULES_FILE):
-    """把规则列表写回 指令规则.txt（GUI 增删改后调用，原文件注释会被覆盖）。"""
+    """把规则列表写回 指令规则.txt（GUI 增删改后调用；保留文件头的说明注释）。"""
     path = Path(path)
-    lines = ["# 文字驱动器规则文件（每行一条规则，用 | 分隔，支持 # 注释）",
-             "# 格式：触发文字|命中指令|关闭指令|延时秒|画面关键词"]
+    lines = RULES_HEADER.splitlines()
     for r in rules:
         lines.append(f"{r['text']}|{r['on']}|{r['off']}|{r['delay']}|{r.get('kw', '')}")
     try:
@@ -420,6 +457,8 @@ class ScreenTextMonitorApp:
         self._vision_ts = 0.0                      # 上次视觉调用时间（冷却用）
         self._serial = None                        # 常驻串口连接（避免每次发送重开端口复位 ESP32）
         self._serial_key = None
+        self._ocr_lock = threading.Lock()          # OCR 引擎只创建一次（防手动识别与监控并发创建）
+        self._err_throttle = {}                    # 监控循环重复报错节流 {key: (msg, ts)}
 
         self.rules = []               # 文字驱动器规则列表
         self._driver_state = []       # 每条规则的运行状态 {"text_hit","kw_hit","active","off_due"}
@@ -744,9 +783,10 @@ class ScreenTextMonitorApp:
 
         def work():
             try:
-                if self.ocr is None:
-                    self.msg_queue.put(("status", "正在加载离线 OCR 模型（首次约需数秒）…"))
-                    self.ocr = create_ocr()
+                with self._ocr_lock:
+                    if self.ocr is None:
+                        self.msg_queue.put(("status", "正在加载离线 OCR 模型（首次约需数秒）…"))
+                        self.ocr = create_ocr()
                 img = capture_region(*self.region)
                 text = ocr_image(self.ocr, img)
                 self._driver_tick(text)               # 文字驱动器匹配
@@ -768,7 +808,7 @@ class ScreenTextMonitorApp:
     def copy_logs_for_dev(self):
         """一键复制最近日志（app.log + 程序错误日志 各 30 行）到剪贴板，发给开发者。"""
         try:
-            chunks = ["【日志（供定位）build=20260905-opt1】"]
+            chunks = ["【日志（供定位）build=20260907-opt2】"]
             for path in (LOG_FILE, ERROR_LOG_FILE):
                 chunks.append("===== " + path.name + " 尾部 30 行 =====")
                 if path.exists():
@@ -821,9 +861,10 @@ class ScreenTextMonitorApp:
         import mss
         sct = None                       # 复用的 mss 实例（失败时置 None 下一轮重建）
         try:
-            if self.ocr is None:
-                self.msg_queue.put(("status", "正在加载离线 OCR 模型（首次约需数秒）…"))
-                self.ocr = create_ocr()
+            with self._ocr_lock:
+                if self.ocr is None:
+                    self.msg_queue.put(("status", "正在加载离线 OCR 模型（首次约需数秒）…"))
+                    self.ocr = create_ocr()
             self.msg_queue.put(("status", "OCR 已就绪，开始监控（只记录新出现的文字）…"))
             logging.getLogger().info("监控循环已启动")
 
@@ -899,7 +940,11 @@ class ScreenTextMonitorApp:
                         continue
                     err = f"监控出错：{e}\n{traceback.format_exc()}"
                     write_error_log(err)
-                    self.msg_queue.put(("error", f"监控出错：{e}（详见 程序错误日志.txt）"))
+                    # 同一种错误 60 秒内只刷一次状态栏，避免持续报错刷屏
+                    last = self._err_throttle.get("monitor")
+                    if last is None or last[0] != msg or time.time() - last[1] > 60:
+                        self._err_throttle["monitor"] = (msg, time.time())
+                        self.msg_queue.put(("error", f"监控出错：{e}（详见 程序错误日志.txt）"))
 
                 # 分小段等待，方便快速停止；总等待 ≈ 识别间隔
                 ticks = max(int(round(self._active_interval / step)), 1)
@@ -1112,8 +1157,7 @@ class ScreenTextMonitorApp:
     def _append_action_log(self, msg):
         try:
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(ACTION_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(f"[{stamp}] {msg}\n")
+            append_text_capped(ACTION_LOG_FILE, f"[{stamp}] {msg}\n")
         except Exception:
             pass
 
@@ -1231,6 +1275,7 @@ class ScreenTextMonitorApp:
         if not self.region:
             messagebox.showwarning("提示", "请先框选监控区域")
             return
+        self._refresh_active_settings()
         threading.Thread(target=self._vision_worker,
                          args=(None, True, self._get_vision_cfg(),
                                self.vision_log_var.get()),
@@ -1416,6 +1461,9 @@ class ScreenTextMonitorApp:
 
     def _on_close(self):
         self.running = False
+        t = self.monitor_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=2.0)          # 等监控线程写完手头的记录再退出
         if self._serial is not None:
             try:
                 self._serial.close()
@@ -1460,7 +1508,7 @@ def selftest():
 def main():
     _setup_logging()
     _install_excepthook()
-    logging.getLogger().info("程序启动 build=20260905-opt1 args=%s", sys.argv[1:])
+    logging.getLogger().info("程序启动 build=20260907-opt2 args=%s", sys.argv[1:])
     if "--selftest" in sys.argv:
         sys.exit(selftest())
     if "--diag" in sys.argv:
@@ -1480,6 +1528,17 @@ def main():
         print("诊断报告已生成：" + str(rep))
         print("请把该文件或 logs\\app.log 尾部 30 行发给开发者。")
         sys.exit(0)
+    if not _acquire_single_instance():
+        # 已有实例在运行：弹窗提示后退出，避免双开同时写记录/抢串口
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                0, "屏幕文字识别监控已经在运行了（请看任务栏）。\n"
+                   "不要重复启动；要重启请先关掉已有窗口或运行 stop.bat。",
+                "提示", 0x40)
+        except Exception:
+            pass
+        logging.getLogger().info("重复启动被拦截（已有实例在运行）")
+        return
     root = tk.Tk()
 
     def _report(exc_type, exc_value, exc_tb):

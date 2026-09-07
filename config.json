@@ -1,0 +1,30 @@
+{
+  "region": [
+    144,
+    953,
+    609,
+    33
+  ],
+  "interval": 1.0,
+  "log_file": "D:\\dupingmu\\屏幕文字记录.txt",
+  "log_daily": false,
+  "confirm_polls": 2,
+  "driver": {
+    "enabled": true,
+    "send_mode": "tcp",
+    "serial_port": "COM3",
+    "baudrate": "115200",
+    "tcp_host": "192.168.1.21",
+    "tcp_port": "8085",
+    "cmd_prefix": "001",
+    "cmd_suffix": ""
+  },
+  "vision": {
+    "enabled": false,
+    "auto": true,
+    "api_key": "",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-v4-pro",
+    "log_file": "D:\\dupingmu\\屏幕画面描述.txt"
+  }
+}
