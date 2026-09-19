@@ -29,17 +29,22 @@
 - 命令行自检：python main.py --selftest   （离线 OCR 是否可用的自检）
 """
 
+import collections
 import ctypes
 import json
 import os
 import queue
+import random
 import socket
 import sys
 import threading
 import time
 import traceback
+import webbrowser
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -62,6 +67,25 @@ DEFAULT_VISION_LOG_FILE = APP_DIR / "屏幕画面描述.txt"
 
 VISION_COOLDOWN_SECONDS = 30   # 视觉自动调用的最小间隔（防高频变化时请求堆积）
 DRIVER_CONFIRM_POLLS = 2       # 驱动器触发文字需连续命中的 OCR 轮数（防抖动重复发指令）
+
+# ---- 对外接口（HTTP，只读内存快照）----
+API_VERSION = "1.0"
+API_DEFAULT_PORT = 18072        # 避开系统动态端口池(1024~15000)，80xx 段会被临时连接抢占
+API_DEFAULT_MAX_RECORDS = 10000  # 内存保留的记录条数上限（超出丢最旧的，老数据仍在 txt 里）
+API_DEFAULT_MAX_AGE_MINUTES = 60  # 内存保留的最长时间跨度（分钟）；与条数上限双重限制
+API_ENDPOINTS = [
+    ("GET", "/health", "存活探测，判断服务在不在"),
+    ("GET", "/status", "运行状态：是否监控中、区域、间隔、延迟"),
+    ("GET", "/current", "当前屏幕区域的完整文字"),
+    ("GET", "/records?since=&limit=", "按 seq 增量拉取记录（1 秒轮询用这个）"),
+    ("GET", "/recent?minutes=30", "最近 N 分钟的全部记录（默认 30 分钟）"),
+    ("GET", "/latest?limit=", "最近 N 条记录（默认 1 = 最近一句）"),
+    ("GET", "/pending", "正在确认中的候选文字"),
+    ("GET", "/text?mode=", "纯文本简版（latest / current / all）"),
+    ("GET", "/wait?since=&timeout=", "长轮询：有新记录立即返回，否则挂起到超时"),
+    ("GET", "/rules", "当前指令规则列表"),
+    ("POST", "/command", "主动发一条指令（需在程序里开启）"),
+]
 
 
 def append_text_capped(path, text, max_bytes=2_000_000):
@@ -427,6 +451,580 @@ class RegionSelector:
 
 
 # ============================================================
+# 对外接口：HTTP 只读内存快照（纯标准库，不引入任何新依赖）
+# ============================================================
+# 设计要点：接口只读内存，绝不触发截图或 OCR。识别仍由 _monitor_loop 按固定节奏跑，
+# HTTP 线程只负责把最新状态序列化返回。理由：
+#   ① RapidOCR 不是线程安全的，并发请求会直接把程序搞崩；
+#   ② 请求驱动的采样率与屏幕变化无关，屏幕没变也要白跑一遍推理，纯浪费算力。
+# 这样 1 秒请求 100 次也不增加负担，响应稳定在毫秒级，OCR 再慢也不拖慢接口。
+
+
+class ApiState:
+    """对外接口的共享内存状态。所有读写都必须持 self.lock。"""
+
+    def __init__(self, max_records=API_DEFAULT_MAX_RECORDS,
+                 max_age_minutes=API_DEFAULT_MAX_AGE_MINUTES):
+        self.lock = threading.Lock()
+        self.boot_id = "%08x" % random.getrandbits(32)  # 每次启动变化，调用方据此识别重启
+        self.started_at = time.time()
+        self.seq = 0                                    # 记录序号，进程内单调递增
+        self.total = 0                                  # 累计记录数（不随队列淘汰减少）
+        self.max_age_ms = max(int(max_age_minutes), 1) * 60000
+        self.records = collections.deque(maxlen=max(int(max_records), 10))
+        self.frame = {"text": "", "lines": [], "ts_ms": 0, "changed": False}
+        self.pending = []
+        self.last_error = None
+
+    # ---- 写入（监控线程调用）----
+    def set_frame(self, text, lines, changed):
+        """更新“最新一帧整屏文字”。"""
+        with self.lock:
+            self.frame = {"text": text, "lines": list(lines),
+                          "ts_ms": int(time.time() * 1000),
+                          "changed": bool(changed)}
+
+    def set_pending(self, items):
+        """更新“正在确认中的候选行”。"""
+        with self.lock:
+            self.pending = list(items)
+
+    def push_record(self, text, screen="", first_seen_ms=None, source="ocr"):
+        """新增一条已确认记录，返回记录对象。"""
+        with self.lock:
+            self.seq += 1
+            self.total += 1
+            now_ms = int(time.time() * 1000)
+            rec = {
+                "seq": self.seq,
+                "text": text,
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ts_ms": now_ms,
+                "first_seen_ms": int(first_seen_ms) if first_seen_ms else now_ms,
+                "screen": screen,
+                "source": source,
+            }
+            self.records.append(rec)
+            # 按时间清理：只保留最近 max_age_ms 内的记录（与条数上限双重限制）
+            cutoff = now_ms - self.max_age_ms
+            while self.records and self.records[0]["ts_ms"] < cutoff:
+                self.records.popleft()
+            return rec
+
+    def set_error(self, msg):
+        with self.lock:
+            self.last_error = msg
+
+    def resize(self, n, max_age_minutes=None):
+        """调整内存保留条数与时间跨度（改配置时调用）。"""
+        n = max(int(n), 10)
+        with self.lock:
+            if max_age_minutes is not None:
+                self.max_age_ms = max(int(max_age_minutes), 1) * 60000
+            if n == self.records.maxlen:
+                return
+            self.records = collections.deque(list(self.records)[-n:], maxlen=n)
+
+    # ---- 读取（HTTP 线程调用）----
+    def fetch(self, since, limit):
+        """返回 (records, last_seq, has_more)。since=None 表示只对齐进度、不返回历史。"""
+        with self.lock:
+            last_seq = self.seq
+            if since is None:
+                return [], last_seq, False
+            buf = [r for r in self.records if r["seq"] > since]
+            return buf[:limit], last_seq, len(buf) > limit
+
+    def tail(self, limit):
+        with self.lock:
+            return list(self.records)[-limit:], self.seq
+
+    def pending_snapshot(self):
+        with self.lock:
+            return [dict(p) for p in self.pending]
+
+    def recent(self, minutes, limit):
+        """返回最近 minutes 分钟内的记录（按时间升序）。
+
+        返回 (records, truncated, oldest_available_ms, cutoff_ms)。
+        truncated=True 表示返回的不是窗口内的全部数据（内存淘汰，或超过 limit），
+        调用方据此判断"这半小时的记录到底完不完整"。
+        """
+        cutoff = int((time.time() - minutes * 60) * 1000)
+        with self.lock:
+            recs = list(self.records)
+            cap = self.records.maxlen or 0
+        if not recs:
+            return [], False, None, cutoff
+        oldest = recs[0]["ts_ms"]
+        # 队列已满说明发生过淘汰；此时最早一条仍落在窗口内，说明窗口起点已被丢掉
+        truncated = bool(cap) and len(recs) >= cap and oldest > cutoff
+        picked = [r for r in recs if r["ts_ms"] >= cutoff]
+        if limit and len(picked) > limit:
+            picked = picked[-limit:]          # 保留最新的 limit 条
+            truncated = True
+        return picked, truncated, oldest, cutoff
+
+    def stats(self):
+        """内存里记录的时间跨度与条数，供 /status 展示。"""
+        with self.lock:
+            recs = list(self.records)
+            cap = self.records.maxlen or 0
+            total = self.total
+            max_age_ms = self.max_age_ms
+        now_ms = int(time.time() * 1000)
+        if not recs:
+            return {"in_memory": 0, "capacity": cap, "records_total": total,
+                    "oldest_ms": None, "newest_ms": None, "span_seconds": 0,
+                    "max_age_minutes": max_age_ms // 60000, "recent_30min": 0}
+        cutoff30 = now_ms - 30 * 60 * 1000
+        return {
+            "in_memory": len(recs),
+            "capacity": cap,
+            "records_total": total,
+            "oldest_ms": recs[0]["ts_ms"],
+            "newest_ms": recs[-1]["ts_ms"],
+            "span_seconds": round((recs[-1]["ts_ms"] - recs[0]["ts_ms"]) / 1000.0, 1),
+            "max_age_minutes": max_age_ms // 60000,
+            "recent_30min": sum(1 for r in recs if r["ts_ms"] >= cutoff30),
+        }
+
+    def wait_for(self, since, timeout):
+        """长轮询：等到 seq > since 或超时，返回是否等到了新记录。"""
+        deadline = time.time() + timeout
+        while True:
+            with self.lock:
+                if self.seq > since:
+                    return True
+            remain = deadline - time.time()
+            if remain <= 0:
+                return False
+            time.sleep(min(1.0, remain))
+
+
+def _parse_int(qs, key, default=None, lo=None, hi=None):
+    """从 query string 解析整数，返回 (值, 错误信息)。未传该参数则返回 default。"""
+    if key not in qs:
+        return default, None
+    raw = (qs[key][0] or "").strip()
+    if raw == "":
+        return default, None
+    try:
+        v = int(raw)
+    except ValueError:
+        return None, "参数 %s 必须是整数" % key
+    if lo is not None and v < lo:
+        return None, "参数 %s 不能小于 %s" % (key, lo)
+    if hi is not None and v > hi:
+        return None, "参数 %s 不能大于 %s" % (key, hi)
+    return v, None
+
+
+def _parse_float(qs, key, default=None, lo=None, hi=None):
+    if key not in qs:
+        return default, None
+    raw = (qs[key][0] or "").strip()
+    if raw == "":
+        return default, None
+    try:
+        v = float(raw)
+    except ValueError:
+        return None, "参数 %s 必须是数字" % key
+    if lo is not None and v < lo:
+        return None, "参数 %s 不能小于 %s" % (key, lo)
+    if hi is not None and v > hi:
+        return None, "参数 %s 不能大于 %s" % (key, hi)
+    return v, None
+
+
+class _ApiHTTPServer(ThreadingHTTPServer):
+    """对外接口用的 HTTP 服务。
+
+    关键点：关掉 SO_REUSEADDR。Windows 的 SO_REUSEADDR 语义是“允许绑定到已被
+    占用的端口”，会让端口占用检测彻底失效——服务看似启动成功，实际收不到请求。
+    监听 socket 关闭不会进 TIME_WAIT，所以关掉它不影响改端口后立刻重启。
+    """
+
+    allow_reuse_address = False
+    daemon_threads = True
+
+
+class ApiServer:
+    """对外只读 HTTP 接口服务。
+
+    start() 绑定端口并起线程，stop() 关闭。端口被占用会抛 OSError，
+    由界面提示用户换端口，不影响监控本身。
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self.httpd = None
+        self.thread = None
+        self.host = ""
+        self.port = 0
+
+    @property
+    def running(self):
+        return self.httpd is not None
+
+    @property
+    def base_url(self):
+        host = "127.0.0.1" if self.host in ("", "0.0.0.0") else self.host
+        return "http://%s:%d" % (host, self.port)
+
+    def status_data(self):
+        """/health 与 /status 的公共数据。"""
+        app = self.app
+        st = app.api_state
+        with st.lock:
+            frame = dict(st.frame)
+            last_seq, total = st.seq, st.total
+            last_rec = dict(st.records[-1]) if st.records else None
+            pending_n = len(st.pending)
+            last_error = st.last_error
+            uptime = time.time() - st.started_at
+        now_ms = int(time.time() * 1000)
+        mem = st.stats()
+        return {
+            "service": "dupingmu",
+            "aliases": ["dupingmu", "screen-text-monitor"],
+            "version": API_VERSION,
+            "uptime_seconds": round(uptime, 1),
+            "monitoring": bool(app.running),
+            "memory": mem,
+            "recent_30min_count": mem.get("recent_30min", 0),
+            "region": list(app.region) if app.region else None,
+            "interval": getattr(app, "_active_interval", None),
+            "confirm_polls": getattr(app, "_active_confirm_polls", None),
+            "ocr_ready": getattr(app, "ocr", None) is not None,
+            "frame_age_ms": (now_ms - frame["ts_ms"]) if frame["ts_ms"] else None,
+            "pending_count": pending_n,
+            "records_total": total,
+            "last_seq": last_seq,
+            "last_record": last_rec,
+            "last_error": last_error,
+            "log_file": getattr(app, "_active_log", None),
+            "driver_enabled": bool(getattr(app, "_active_driver_enabled", False)),
+            "vision_enabled": bool(getattr(app, "_active_vision_enabled", False)),
+        }
+
+    def start(self, host, port, token, allow_command):
+        """启动服务并返回访问地址。端口占用等错误向上抛 OSError。"""
+        self.stop()
+        app = self.app
+        st = app.api_state
+        srv = self
+        port = int(port)
+
+        def ok(data):
+            return {"ok": True, "server": "dupingmu",
+                    "boot_id": st.boot_id, "data": data}
+
+        def err(code, message):
+            return {"ok": False, "server": "dupingmu", "boot_id": st.boot_id,
+                    "error": {"code": code, "message": message}}
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"   # 每个请求独立连接，简单可靠
+
+            def log_message(self, fmt, *args):
+                logging.getLogger().debug("api %s %s", self.address_string(), fmt % args)
+
+            # ---- 响应 ----
+            def _send(self, body, ctype, status=200):
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _json(self, obj, status=200):
+                self._send(json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                           "application/json; charset=utf-8", status)
+
+            def _plain(self, s, status=200):
+                self._send(s.encode("utf-8"), "text/plain; charset=utf-8", status)
+
+            def _html(self, s, status=200):
+                self._send(s.encode("utf-8"), "text/html; charset=utf-8", status)
+
+            # ---- 入口 ----
+            def do_GET(self):
+                self._dispatch("GET")
+
+            def do_POST(self):
+                self._dispatch("POST")
+
+            def _dispatch(self, method):
+                try:
+                    self._route(method)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass                        # 调用方主动断开（长轮询常见），不算错误
+                except Exception as e:
+                    write_error_log("接口处理异常：%s\n%s" % (e, traceback.format_exc()))
+                    st.set_error(str(e))
+                    try:
+                        self._json(err("internal_error", str(e)), 500)
+                    except Exception:
+                        pass
+
+            def _route(self, method):
+                parsed = urlparse(self.path)
+                path = parsed.path.rstrip("/") or "/"
+                qs = parse_qs(parsed.query)
+
+                if not self._auth(qs):
+                    return self._json(err("unauthorized", "令牌缺失或错误"), 401)
+
+                table = {
+                    "/": self._h_index,
+                    "/health": self._h_health,
+                    "/status": self._h_status,
+                    "/current": self._h_current,
+                    "/records": self._h_records,
+                    "/recent": self._h_recent,
+                    "/latest": self._h_latest,
+                    "/pending": self._h_pending,
+                    "/text": self._h_text,
+                    "/wait": self._h_wait,
+                    "/rules": self._h_rules,
+                    "/command": self._h_command,
+                }
+                fn = table.get(path)
+                if fn is None:
+                    return self._json(err("not_found", "未知路径：" + path), 404)
+                if path == "/command":
+                    if method != "POST":
+                        return self._json(
+                            err("method_not_allowed", "/command 只支持 POST"), 405)
+                elif method != "GET":
+                    return self._json(
+                        err("method_not_allowed", path + " 只支持 GET"), 405)
+                return fn(qs)
+
+            def _auth(self, qs):
+                if not token:
+                    return True
+                got = (self.headers.get("X-Auth-Token") or "").strip()
+                if not got:
+                    got = (qs.get("token", [""])[0] or "").strip()
+                return got == token
+
+            # ---- 各接口 ----
+            def _h_index(self, qs):
+                rows = "".join(
+                    "<tr><td><code>%s</code></td><td><code>%s</code></td>"
+                    "<td>%s</td></tr>" % e for e in API_ENDPOINTS)
+                # 注意：这里不能用 % 格式化——CSS 里的 width:100%} 会被当成格式符。
+                # 用占位符替换，彻底绕开 % 和 {} 的转义问题。
+                html = (
+                    "<!doctype html><meta charset='utf-8'>"
+                    "<title>屏幕文字识别监控 · 对外接口</title>"
+                    "<style>body{font-family:system-ui,'Microsoft YaHei UI',sans-serif;"
+                    "margin:32px;max-width:780px;line-height:1.6}"
+                    "table{border-collapse:collapse;width:100%}"
+                    "td,th{border:1px solid #bbb;padding:6px 10px;text-align:left}"
+                    "code{background:#f2f2f2;padding:1px 5px;border-radius:3px}</style>"
+                    "<h2>屏幕文字识别监控 · 对外接口</h2>"
+                    "<p>服务标识 <code>dupingmu</code>　启动 ID <code>@@BOOT@@</code>"
+                    "　版本 <code>@@VER@@</code></p>"
+                    "<table><tr><th>方法</th><th>路径</th><th>说明</th></tr>"
+                    "@@ROWS@@</table>"
+                    "<p>轮询取新话：<code>GET /records?since={上次的 last_seq}</code><br>"
+                    "最近半小时全部：<code>GET /recent?minutes=30</code><br>"
+                    "取最近一句：<code>GET /latest?limit=1</code>　"
+                    "取整屏文字：<code>GET /current</code><br>"
+                    "低延迟等待：<code>GET /wait?since={last_seq}&amp;timeout=10</code></p>"
+                    "<p>完整说明见程序目录下的 <code>接口文档.md</code></p>"
+                ).replace("@@BOOT@@", st.boot_id).replace(
+                    "@@VER@@", API_VERSION).replace("@@ROWS@@", rows)
+                self._html(html)
+
+            def _h_health(self, qs):
+                self._json(ok(srv.status_data()))
+
+            def _h_status(self, qs):
+                self._json(ok(srv.status_data()))
+
+            def _h_current(self, qs):
+                with st.lock:
+                    frame = dict(st.frame)
+                now_ms = int(time.time() * 1000)
+                data = {
+                    "text": frame["text"],
+                    "lines": list(frame["lines"]),
+                    "frame_ts_ms": frame["ts_ms"],
+                    "frame_age_ms": (now_ms - frame["ts_ms"]) if frame["ts_ms"] else None,
+                    "changed": frame["changed"],
+                }
+                if frame["ts_ms"]:
+                    data["frame_ts"] = datetime.fromtimestamp(
+                        frame["ts_ms"] / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+                if not app.running:
+                    data["note"] = "监控未启动"
+                self._json(ok(data))
+
+            def _h_records(self, qs):
+                since, e1 = _parse_int(qs, "since", None, lo=0)
+                if e1:
+                    return self._json(err("bad_param", e1), 400)
+                limit, e2 = _parse_int(qs, "limit", 50, lo=1, hi=500)
+                if e2:
+                    return self._json(err("bad_param", e2), 400)
+                fmt = (qs.get("format", ["json"])[0] or "json").strip().lower()
+                recs, last_seq, has_more = st.fetch(since, limit)
+                if fmt == "text":
+                    return self._plain("\n".join(r["text"] for r in recs))
+                with st.lock:
+                    pending_n = len(st.pending)
+                self._json(ok({"records": recs, "count": len(recs),
+                               "last_seq": last_seq, "has_more": has_more,
+                               "pending_count": pending_n,
+                               "monitoring": bool(app.running)}))
+
+            def _h_recent(self, qs):
+                minutes, e1 = _parse_int(qs, "minutes", 30, lo=1, hi=1440)
+                if e1:
+                    return self._json(err("bad_param", e1), 400)
+                limit, e2 = _parse_int(qs, "limit", 2000, lo=1, hi=10000)
+                if e2:
+                    return self._json(err("bad_param", e2), 400)
+                fmt = (qs.get("format", ["json"])[0] or "json").strip().lower()
+                recs, truncated, oldest, cutoff = st.recent(minutes, limit)
+                if fmt == "text":
+                    return self._plain("\n".join(r["text"] for r in recs))
+                with st.lock:
+                    cap = st.records.maxlen or 0
+                    max_age = st.max_age_ms // 60000
+                    last_seq = st.seq
+                data = {
+                    "records": recs,
+                    "count": len(recs),
+                    "minutes": minutes,
+                    "from_ms": cutoff,
+                    "to_ms": int(time.time() * 1000),
+                    "truncated": truncated,
+                    "oldest_available_ms": oldest,
+                    "last_seq": last_seq,
+                    "monitoring": bool(app.running),
+                }
+                if truncated:
+                    data["note"] = (
+                        "返回的不是该时间窗口内的全部记录：内存只保留最近 %d 条 / %d 分钟，"
+                        "更早的历史请读记录 txt 文件。" % (cap, max_age))
+                self._json(ok(data))
+
+            def _h_latest(self, qs):
+                limit, e = _parse_int(qs, "limit", 1, lo=1, hi=500)
+                if e:
+                    return self._json(err("bad_param", e), 400)
+                recs, last_seq = st.tail(limit)
+                self._json(ok({"records": recs, "count": len(recs),
+                               "last_seq": last_seq}))
+
+            def _h_pending(self, qs):
+                items = st.pending_snapshot()
+                now_ms = int(time.time() * 1000)
+                for it in items:
+                    it["age_ms"] = now_ms - int(it.get("first_seen_ms") or now_ms)
+                self._json(ok({"pending": items, "count": len(items)}))
+
+            def _h_text(self, qs):
+                mode = (qs.get("mode", ["latest"])[0] or "latest").strip().lower()
+                if mode == "current":
+                    with st.lock:
+                        s = st.frame["text"]
+                elif mode == "all":
+                    recs, _ = st.tail(10)
+                    s = "\n".join(r["text"] for r in recs)
+                elif mode == "recent":
+                    minutes, e = _parse_int(qs, "minutes", 30, lo=1, hi=1440)
+                    if e:
+                        return self._plain("")
+                    recs, _t, _o, _c = st.recent(minutes, 10000)
+                    s = "\n".join(r["text"] for r in recs)
+                else:
+                    recs, _ = st.tail(1)
+                    s = recs[0]["text"] if recs else ""
+                self._plain(s)
+
+            def _h_wait(self, qs):
+                since, e1 = _parse_int(qs, "since", None, lo=0)
+                if e1:
+                    return self._json(err("bad_param", e1), 400)
+                if since is None:
+                    return self._json(err("bad_param", "必须提供 since 参数"), 400)
+                tmo, e2 = _parse_float(qs, "timeout", 10.0, lo=0.0, hi=30.0)
+                if e2:
+                    return self._json(err("bad_param", e2), 400)
+                t0 = time.time()
+                got = st.wait_for(since, tmo)
+                recs, last_seq, has_more = st.fetch(since, 500)
+                self._json(ok({"records": recs, "count": len(recs),
+                               "last_seq": last_seq, "has_more": has_more,
+                               "waited_ms": int((time.time() - t0) * 1000),
+                               "timed_out": not got}))
+
+            def _h_rules(self, qs):
+                rules = [dict(r) for r in list(app.rules)]
+                self._json(ok({"rules": rules, "count": len(rules)}))
+
+            def _h_command(self, qs):
+                if not allow_command:
+                    return self._json(err(
+                        "forbidden",
+                        "服务端未开启 /command（在程序“对外接口”页签勾选后重试）"), 403)
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    body_raw = self.rfile.read(n) if n > 0 else b""
+                    body = json.loads(body_raw.decode("utf-8")) if body_raw else {}
+                except Exception:
+                    return self._json(err("bad_param", "请求体不是合法 JSON"), 400)
+                code = str(body.get("code") or "").strip()
+                if not code:
+                    return self._json(err("bad_param", "缺少 code 字段"), 400)
+                if not app.running:
+                    return self._json(err(
+                        "not_monitoring", "监控未启动，请先在程序里点开始监控"), 409)
+                cfg = app._active_driver_cfg
+                if not cfg:
+                    return self._json(err("not_ready", "发送接口设置未就绪"), 409)
+                label = str(body.get("label") or "外部触发").strip()
+                cmd = cfg.get("cmd_prefix", "") + code + cfg.get("cmd_suffix", "")
+                app._send_queue.put((cmd, cfg, label))
+                self._json(ok({"sent": cmd, "queued": True}))
+
+        httpd = _ApiHTTPServer((host, port), Handler)
+        self.httpd = httpd
+        self.host = host
+        self.port = port
+        self.thread = threading.Thread(target=httpd.serve_forever, daemon=True,
+                                       name="api-server")
+        self.thread.start()
+        return self.base_url
+
+    def stop(self):
+        """关闭服务（可重复调用）。"""
+        if self.httpd is not None:
+            try:
+                self.httpd.shutdown()
+            except Exception:
+                pass
+            try:
+                self.httpd.server_close()
+            except Exception:
+                pass
+            self.httpd = None
+        if self.thread is not None:
+            try:
+                self.thread.join(timeout=2.0)
+            except Exception:
+                pass
+            self.thread = None
+
+
+# ============================================================
 # 主程序
 # ============================================================
 class ScreenTextMonitorApp:
@@ -459,6 +1057,8 @@ class ScreenTextMonitorApp:
         self._serial_key = None
         self._ocr_lock = threading.Lock()          # OCR 引擎只创建一次（防手动识别与监控并发创建）
         self._err_throttle = {}                    # 监控循环重复报错节流 {key: (msg, ts)}
+        self.api_state = ApiState()                # 对外接口的内存快照（供其他项目读取）
+        self.api_server = ApiServer(self)          # 对外 HTTP 接口服务（纯标准库实现）
 
         self.rules = []               # 文字驱动器规则列表
         self._driver_state = []       # 每条规则的运行状态 {"text_hit","kw_hit","active","off_due"}
@@ -474,6 +1074,7 @@ class ScreenTextMonitorApp:
         self._load_config()
         self._load_driver_rules(announce=False)
         self._refresh_active_settings()
+        self._apply_api_settings(announce=False)   # 按配置自动启停对外接口
         self._send_queue = queue.Queue()
         threading.Thread(target=self._sender_loop, daemon=True,
                          name="cmd-sender").start()   # 指令发送线程：串口/TCP 超时不阻塞监控
@@ -487,12 +1088,15 @@ class ScreenTextMonitorApp:
         self.tab_monitor = ttk.Frame(self.nb)
         self.tab_driver = ttk.Frame(self.nb)
         self.tab_vision = ttk.Frame(self.nb)
+        self.tab_api = ttk.Frame(self.nb)
         self.nb.add(self.tab_monitor, text="  屏幕监控  ")
         self.nb.add(self.tab_driver, text="  文字驱动器  ")
         self.nb.add(self.tab_vision, text="  DeepSeek 视觉  ")
+        self.nb.add(self.tab_api, text="  对外接口  ")
         self._build_monitor_tab()
         self._build_driver_tab()
         self._build_vision_tab()
+        self._build_api_tab()
 
     # ---------------- 页签一：屏幕监控 ----------------
     def _build_monitor_tab(self):
@@ -699,6 +1303,147 @@ class ScreenTextMonitorApp:
         self.vis_txt.config(state="disabled")
         self.vis_txt.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
+    # ---------------- 页签四：对外接口 ----------------
+    def _build_api_tab(self):
+        pad = {"padx": 10, "pady": 6}
+
+        frm = tk.LabelFrame(self.tab_api, text="服务设置（只读接口，其他项目用它读取屏幕文字）",
+                            padx=10, pady=8)
+        frm.pack(fill="x", **pad)
+
+        self.api_enabled_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(frm, text="启用对外接口（HTTP，只读内存，不触发截图/OCR）",
+                       variable=self.api_enabled_var).grid(
+            row=0, column=0, columnspan=4, sticky="w")
+
+        tk.Label(frm, text="端口：").grid(row=1, column=0, sticky="w", pady=3)
+        self.api_port_var = tk.StringVar(value=str(API_DEFAULT_PORT))
+        self.api_port_entry = tk.Entry(frm, textvariable=self.api_port_var, width=8)
+        self.api_port_entry.grid(row=1, column=1, sticky="w")
+
+        self.api_lan_var = tk.BooleanVar(value=False)
+        self.api_lan_chk = tk.Checkbutton(
+            frm, text="允许局域网访问（默认仅本机；开启后建议设令牌）",
+            variable=self.api_lan_var)
+        self.api_lan_chk.grid(row=1, column=2, columnspan=2, sticky="w", padx=(16, 0))
+
+        tk.Label(frm, text="访问令牌：").grid(row=2, column=0, sticky="w", pady=3)
+        self.api_token_var = tk.StringVar(value="")
+        self.api_token_entry = tk.Entry(frm, textvariable=self.api_token_var, width=20)
+        self.api_token_entry.grid(row=2, column=1, sticky="w")
+
+        self.api_allow_cmd_var = tk.BooleanVar(value=False)
+        self.api_allow_cmd_chk = tk.Checkbutton(
+            frm, text="允许 POST /command 主动发指令（默认关闭）",
+            variable=self.api_allow_cmd_var)
+        self.api_allow_cmd_chk.grid(row=2, column=2, columnspan=2, sticky="w", padx=(16, 0))
+
+        tk.Label(frm, text="内存保留：").grid(row=3, column=0, sticky="w", pady=3)
+        self.api_maxrec_var = tk.StringVar(value=str(API_DEFAULT_MAX_RECORDS))
+        self.api_maxrec_entry = tk.Entry(frm, textvariable=self.api_maxrec_var, width=8)
+        self.api_maxrec_entry.grid(row=3, column=1, sticky="w")
+        tk.Label(frm, text="条（供 /recent 回溯用，超出丢最旧的）", fg="gray").grid(
+            row=3, column=2, columnspan=2, sticky="w", padx=(16, 0))
+
+        frm2 = tk.Frame(self.tab_api)
+        frm2.pack(fill="x", **pad)
+        tk.Button(frm2, text="应用并重启接口",
+                  command=lambda: self._apply_api_settings(True)).pack(side="left")
+        tk.Button(frm2, text="在浏览器打开接口首页",
+                  command=self._open_api_home).pack(side="left", padx=8)
+        tk.Button(frm2, text="打开接口文档",
+                  command=self._open_api_doc).pack(side="left")
+
+        self.api_state_var = tk.StringVar(value="未启动")
+        tk.Label(self.tab_api, textvariable=self.api_state_var, fg="#1a66cc",
+                 anchor="w", wraplength=660).pack(fill="x", **pad)
+
+        tk.Label(self.tab_api, text="接口速查：", anchor="w").pack(fill="x", padx=10)
+        self.api_txt = tk.Text(self.tab_api, height=12, wrap="none",
+                               font=("Consolas", 9))
+        lines = ["%-4s %-32s %s" % (m, p, d) for m, p, d in API_ENDPOINTS]
+        lines += [
+            "",
+            "轮询取新话（1 秒 1 次就用它）：",
+            "    GET /records?since={上次返回的 last_seq}",
+            "最近半小时全部记录：GET /recent?minutes=30",
+            "取最近一句话：      GET /latest?limit=1",
+            "取整屏文字：        GET /current",
+            "低延迟（挂起等待）：GET /wait?since={last_seq}&timeout=10",
+            "",
+            "注意：程序重启后 seq 会归零。请比对响应里的 boot_id，变了就重新从 0 开始。",
+        ]
+        self.api_txt.insert("1.0", "\n".join(lines))
+        self.api_txt.config(state="disabled")
+        self.api_txt.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _api_port_or_default(self):
+        try:
+            p = int(str(self.api_port_var.get()).strip())
+            return p if 1 <= p <= 65535 else API_DEFAULT_PORT
+        except Exception:
+            return API_DEFAULT_PORT
+
+    def _api_maxrec_or_default(self):
+        try:
+            n = int(str(self.api_maxrec_var.get()).strip())
+            return n if 100 <= n <= 200000 else API_DEFAULT_MAX_RECORDS
+        except Exception:
+            return API_DEFAULT_MAX_RECORDS
+
+    def _apply_api_settings(self, announce=True):
+        """按界面设置启停接口服务。启动失败（端口占用等）只提示，不影响监控。"""
+        if not self.api_enabled_var.get():
+            self.api_server.stop()
+            self.api_state_var.set("已关闭（其他项目无法读取）")
+            return
+        host = "0.0.0.0" if self.api_lan_var.get() else "127.0.0.1"
+        port = self._api_port_or_default()
+        self.api_port_var.set(str(port))
+        self.api_state.resize(self._api_maxrec_or_default())
+        token = self.api_token_var.get().strip()
+        allow_command = bool(self.api_allow_cmd_var.get())
+        try:
+            url = self.api_server.start(host, port, token, allow_command)
+            self.api_state_var.set("监听中　%s　（%d 个接口，%s）" % (
+                url, len(API_ENDPOINTS),
+                "仅本机" if host == "127.0.0.1" else "允许局域网"))
+            logging.getLogger().info("对外接口已启动 %s token=%s cmd=%s",
+                                     url, bool(token), allow_command)
+            if announce:
+                self.status_var.set("对外接口已启动：" + url)
+        except OSError as e:
+            self.api_state_var.set("启动失败：端口 %d 无法监听（%s）" % (port, e))
+            write_error_log("对外接口启动失败：%s\n%s" % (e, traceback.format_exc()))
+            if announce:
+                messagebox.showerror(
+                    "接口启动失败",
+                    "端口 %d 无法监听：\n%s\n\n请换一个端口，或检查是否被其他程序占用。"
+                    % (port, e))
+        except Exception as e:
+            self.api_state_var.set("启动失败：%s" % e)
+            write_error_log("对外接口启动失败：%s\n%s" % (e, traceback.format_exc()))
+
+    def _open_api_home(self):
+        if not self.api_server.running:
+            messagebox.showinfo("提示",
+                                "接口服务未启动。\n请先勾选“启用对外接口”并点“应用并重启接口”。")
+            return
+        try:
+            webbrowser.open(self.api_server.base_url + "/")
+        except Exception as e:
+            messagebox.showerror("错误", "无法打开浏览器：%s" % e)
+
+    def _open_api_doc(self):
+        path = APP_DIR / "接口文档.md"
+        if not path.exists():
+            messagebox.showinfo("提示", "接口文档不存在：\n%s" % path)
+            return
+        try:
+            os.startfile(str(path))  # noqa: 用系统默认程序打开
+        except Exception as e:
+            messagebox.showerror("错误", "无法打开文档：%s" % e)
+
     def _vision_enabled_changed(self):
         if self.vision_enabled_var.get():
             self.vision_status_var.set("视觉理解已启用（屏幕文字变化时自动描述）")
@@ -871,7 +1616,9 @@ class ScreenTextMonitorApp:
             step = 0.1                       # 轮询步长（秒）
             confirm_polls = max(int(self._active_confirm_polls), 1)
             prev_counts = {}                 # 上一帧各文字行的出现次数
-            candidates = {}                  # 待确认的新文字行 -> 已连续出现次数
+            # 待确认的新文字行 -> {"n": 已连续出现轮数, "first_ms": 首次出现时间(epoch 毫秒)}
+            # first_ms 是给对外接口用的：调用方据此知道这句话实际什么时候出现在屏幕上
+            candidates = {}
             prev_img_bytes = None            # 上一帧图像字节（像素级“变了才 OCR”预检）
             last_full_text = None            # 上一帧完整文字（用于触发视觉描述）
 
@@ -895,24 +1642,38 @@ class ScreenTextMonitorApp:
                         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
                         additions, cur_counts = diff_new_lines(prev_counts, lines)
                         prev_counts = cur_counts
+                        now_ms = int(time.time() * 1000)
 
                         # 已不在画面里的候选作废（跳过 OCR 半帧/抖动产生的残影）
                         present = {ln for ln, n in cur_counts.items() if n > 0}
-                        candidates = {c: n for c, n in candidates.items()
+                        candidates = {c: v for c, v in candidates.items()
                                       if c in present}
                         for a in additions:              # 新冒出的行加入候选
-                            candidates.setdefault(a, 0)
-                        for c in candidates:             # 每轮识别算一次“在场”
-                            candidates[c] += 1
+                            candidates.setdefault(a, {"n": 0, "first_ms": now_ms})
+                        for v in candidates.values():    # 每轮识别算一次“在场”
+                            v["n"] += 1
 
-                        confirmed = [c for c, n in candidates.items()
-                                     if n >= confirm_polls]
+                        confirmed = [c for c, v in candidates.items()
+                                     if v["n"] >= confirm_polls]
+                        confirmed_info = [(c, candidates[c]["first_ms"])
+                                          for c in confirmed]
                         for c in confirmed:
                             candidates.pop(c, None)
                         if confirmed:
                             self._append_log("\n".join(confirmed))
+                            # 同步推给对外接口（内存队列，供其他项目按 seq 拉取）
+                            for c, first_ms in confirmed_info:
+                                self.api_state.push_record(
+                                    c, screen=text, first_seen_ms=first_ms)
                             self.msg_queue.put(("status", datetime.now().strftime(
                                 "%H:%M:%S") + " 新增文字已写入记录文件"))
+
+                        # 更新对外接口的内存快照（最新帧 + 确认中的候选）
+                        self.api_state.set_frame(text, lines, changed)
+                        self.api_state.set_pending([
+                            {"text": c, "seen_count": v["n"], "need": confirm_polls,
+                             "first_seen_ms": v["first_ms"]}
+                            for c, v in candidates.items()])
                         self.msg_queue.put(("last", text or "（区域内无文字）"))
 
                         # 完整文字发生变化时自动调视觉模型描述画面（后台线程，不阻塞监控）
@@ -940,6 +1701,7 @@ class ScreenTextMonitorApp:
                         continue
                     err = f"监控出错：{e}\n{traceback.format_exc()}"
                     write_error_log(err)
+                    self.api_state.set_error(str(e))
                     # 同一种错误 60 秒内只刷一次状态栏，避免持续报错刷屏
                     last = self._err_throttle.get("monitor")
                     if last is None or last[0] != msg or time.time() - last[1] > 60:
@@ -1387,6 +2149,26 @@ class ScreenTextMonitorApp:
                 if v.get("log_file"):
                     self.vision_log_var.set(v["log_file"])
                 self._vision_enabled_changed()
+                a = cfg.get("api") or {}
+                self.api_enabled_var.set(bool(a.get("enabled", True)))
+                try:
+                    self.api_port_var.set(str(int(a.get("port", API_DEFAULT_PORT))))
+                except Exception:
+                    self.api_port_var.set(str(API_DEFAULT_PORT))
+                self.api_lan_var.set(
+                    str(a.get("bind", "127.0.0.1")).strip() == "0.0.0.0")
+                self.api_token_var.set(str(a.get("token", "") or ""))
+                self.api_allow_cmd_var.set(bool(a.get("allow_command", False)))
+                try:
+                    mr = int(a.get("max_records", API_DEFAULT_MAX_RECORDS))
+                except Exception:
+                    mr = API_DEFAULT_MAX_RECORDS
+                self.api_maxrec_var.set(str(mr))
+                try:
+                    ma = int(a.get("max_age_minutes", API_DEFAULT_MAX_AGE_MINUTES))
+                except Exception:
+                    ma = API_DEFAULT_MAX_AGE_MINUTES
+                self.api_state.resize(mr, ma)
         except Exception:
             pass
 
@@ -1415,6 +2197,15 @@ class ScreenTextMonitorApp:
                     "base_url": self.vision_url_var.get().strip(),
                     "model": self.vision_model_var.get().strip(),
                     "log_file": self.vision_log_var.get(),
+                },
+                "api": {
+                    "enabled": bool(self.api_enabled_var.get()),
+                    "port": self._api_port_or_default(),
+                    "bind": "0.0.0.0" if self.api_lan_var.get() else "127.0.0.1",
+                    "token": self.api_token_var.get().strip(),
+                    "allow_command": bool(self.api_allow_cmd_var.get()),
+                    "max_records": self._api_maxrec_or_default(),
+                    "max_age_minutes": self.api_state.max_age_ms // 60000,
                 },
             }
             CONFIG_FILE.write_text(
@@ -1464,6 +2255,10 @@ class ScreenTextMonitorApp:
         t = self.monitor_thread
         if t is not None and t.is_alive():
             t.join(timeout=2.0)          # 等监控线程写完手头的记录再退出
+        try:
+            self.api_server.stop()       # 先停接口，避免退出期间还有请求进来
+        except Exception:
+            pass
         if self._serial is not None:
             try:
                 self._serial.close()

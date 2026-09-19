@@ -1,9 +1,9 @@
 {
   "region": [
-    144,
-    953,
-    609,
-    33
+    395,
+    682,
+    488,
+    41
   ],
   "interval": 1.0,
   "log_file": "D:\\dupingmu\\屏幕文字记录.txt",
@@ -26,5 +26,14 @@
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-v4-pro",
     "log_file": "D:\\dupingmu\\屏幕画面描述.txt"
+  },
+  "api": {
+    "enabled": true,
+    "port": 18072,
+    "bind": "127.0.0.1",
+    "token": "",
+    "allow_command": false,
+    "max_records": 10000,
+    "max_age_minutes": 60
   }
 }
